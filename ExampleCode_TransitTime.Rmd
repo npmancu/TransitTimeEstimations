@@ -1,0 +1,364 @@
+---
+title: "Example Code for Transit Time Analyses"
+author: "Noah Mancuso"
+date: "2024-08-15"
+output: html_document
+---
+
+Load packages
+```{r}
+pacman::p_load(tidyverse,    #general data wrangling
+               tidycensus,   #importing Census attribute data into R
+               sf,           #Spatial data classes
+               tmap,         #Mapping/cartography
+               SpatialEpi,   #spatial analysis package with Empirical Bayes
+               tigris,
+               ggmap,
+               googleway,
+               gmapsdistance,
+               tibble,
+               readxl,
+               geosphere,
+               multcomp,
+               here)       
+
+```
+
+
+Getting Variables from ACS/Census
+```{r}
+#Get variables from 5-year pooled data (2020 was last year it was done)
+options(tigris_use_cache = TRUE)
+all_acs_vars <- load_variables(year = 2020, dataset = 'acs5', cache = T) 
+
+#Explore all_acs_vars to determine which one you are interested in using
+#Below is an example selecting # of people who have Hispanic/Latino ethnicity
+eth_var <- c('B03002_012') 
+
+#You also probably want to get a count of total number of people
+total_pop <- c('B02001_001') 
+
+#Concatenate all variables you want to extract
+all_vars <- c(eth_var, total_pop) 
+
+
+#Get actual data from ACS/Census
+ga_eth <- get_acs(
+  geography = "cbg", #this can be changed to census tract or county
+  variables = all_vars, #this will be the full list of variables you make from above
+  state = "GA", #you can do a list of multiple states too
+  year = 2020,
+  geometry = F
+) %>% dplyr::select(-moe)
+
+
+#Reorganize so all variables are in one row and calculate %
+tot_pop <- ga_eth %>%
+  filter(variable == 'B02001_001') %>%  #pull out total count of people variable
+  rename(TOTPOP = estimate) %>%         #rename that variable
+  dplyr::select(-variable)              #drop unnecessary variables
+
+hisp_num <- ga_eth %>%
+  filter(variable == 'B03002_012') %>%  #keep variable for Hispanic or Latino
+  rename(TOTHISP = estimate) %>%        #rename that variable
+  dplyr::select(-variable)              #drop unnecessary variables
+
+ga_eth_comb <- tot_pop %>%
+  left_join(hisp_num, by = 'GEOID') %>%
+  mutate(hisp_percent = (TOTHISP/TOTPOP)*100) %>%
+  dplyr::select(GEOID, TOTPOP, TOTHISP, hisp_percent)
+
+```
+
+
+Import Centroids
+```{r}
+#update to your correct file name and type
+centroids <- read.csv('CensusBlock_Centroids_GA_2020.txt')
+
+#Create single lat_lon column b/c Google Maps requires it in this format
+#Note: in my txt file the variables were called LATITUDE and LONGITUDE, rename accordingly
+centroids$lat_lon <- paste(centroids$LATITUDE, centroids$LONGITUDE, sep=", ")
+
+```
+
+
+Import PrEP Clinics
+```{r}
+#update to your correct file name and type
+clinics <- read_excel('PrEPClinics_GA.xlsx')
+
+#Extract lat and long from file
+#Note: my clinics file already had lat and long as ONE variable, if yours does not then you need to update using sample code from centroids chunk above
+clinics_coordinates <- clinics$field_org_lat_long 
+```
+
+
+Narrowing down to ten closest clinics for each centroid to reduce computational burden
+```{r}
+#Function to split lat and lon (we combined earlier which is required for the next step)
+split_lat_long <- function(df) {
+  # Split lat and lon into two separate columns
+  df[c("latitude", "longitude")] <- t(sapply(strsplit(as.character(df$field_org_lat_long), ", "), as.numeric))
+  return(df)
+}
+
+#Apply function
+clinics_split <- split_lat_long(clinics)
+
+#Subset your centroids to your city/region (mine were from the full state and I only needed metro-Atlanta)
+centroids_ATL <- centroids %>%
+  filter(COUNTYFP %in% c('067','089','121','135'))
+
+
+#Create function to calculate Haversine distance
+calculate_distance <- function(clinic, centroid) {
+  point1 <- c(clinic$longitude, clinic$latitude)
+  point2 <- c(centroid$LONGITUDE, centroid$LATITUDE)
+  haversine_distance <- distVincentySphere(point1, point2)
+  
+  #Return a list with distance, clinic latitude, and clinic longitude
+  result <- list(
+    distance = haversine_distance,
+    clinic_latitude = clinic$latitude,
+    clinic_longitude = clinic$longitude
+  )
+  return(result)
+}
+
+#Create a list to store distances and clinic coordinates
+distance_list <- vector("list", length = nrow(centroids_ATL))
+
+#Perform function by iterating through centroids
+for (i in 1:nrow(centroids_ATL)) {
+  #Iterate through clinics
+  distance_list[[i]] <- lapply(1:nrow(clinics_split), function(j) {
+    calculate_distance(clinics_split[j, ], centroids_ATL[i, ])
+  })
+}
+
+
+#Create function to find the ten closest clinics to each centroid
+find_ten_closest_clinics <- function(centroid_list) {
+  # Sort the clinics based on the distance
+  sorted_clinics <- centroid_list[order(sapply(centroid_list, function(x) x$distance))]
+  
+  # Select the top 10 clinics
+  top_10_clinics <- sorted_clinics[1:10]
+  
+  # Extract the relevant information (distance, clinic_latitude, clinic_longitude)
+  result <- lapply(top_10_clinics, function(clinic) {
+    c(distance = clinic$distance, clinic_latitude = clinic$clinic_latitude, clinic_longitude = clinic$clinic_longitude)
+  })
+  
+  return(result)
+}
+
+#Apply the function to each element in distance_list
+closest_clinics_list <- lapply(distance_list, find_ten_closest_clinics)
+
+```
+
+
+Use Google Maps Distance API to get transit times for ten closest clinics
+```{r}
+#Make sure you register with account and get an API key
+api_key = '1234' #update with your key here
+register_google(key = api_key)
+
+#Create the function to calculate travel time from a centroid to its closest clinics
+calculate_travel_time <- function(centroid, closest_clinics) {
+  #Extract latitude and longitude of the centroid
+  centroid_lat <- centroid$LATITUDE
+  centroid_lon <- centroid$LONGITUDE
+  
+ #Create an empty list to store results
+  results_list <- list()
+  
+  #Extract information for each of the 10 closest clinics
+  for (clinic_info in closest_clinics) {
+    clinic_info <- as.list(clinic_info)
+    # Extract clinic latitude, longitude, and distance
+    clinic_lat <- clinic_info$clinic_latitude
+    clinic_lon <- clinic_info$clinic_longitude
+    
+    tryCatch({
+      #Format the origin and destination strings
+      origin <- paste(centroid_lat, centroid_lon, sep = ",")
+      destination <- paste(clinic_lat, clinic_lon, sep = ",")
+      
+      #Use gmapsdistance to get travel time
+      result <- gmapsdistance(origin = origin,
+                               destination = destination,
+                               mode = "transit",
+                               dep_date = "2023-12-20", # provided as string in ISO 8601 format
+                               dep_time = "12:00:00", # provided as string in HH:MM:SS format
+                               key = api_key)
+      
+      #Extract travel time from the result - note it returns seconds so divide by 60 to get minutes
+      travel_time <- result[["Time"]] / 60
+      
+      #Store the results in the list
+      results_list <- append(results_list, list(travel_time))
+    }, error = function(e) {
+      #Handle errors, you can print a message or take other actions
+      cat("Error calculating travel time:", e$message, "\n")
+      #Store NA to indicate an error occurred
+      results_list <- append(results_list, list(NA))
+    })
+  }
+  
+  return(results_list)
+}
+
+#Create an empty list to store all results
+all_results_list <- list()
+
+
+#Apply function by iterating through each centroid and its closest clinics
+for (i in seq_along(closest_clinics_list)) {
+  centroid <- as.data.frame(centroids_ATL[i, ])
+  
+  #Extract the 10 closest clinics for the current centroid
+  closest_clinics <- closest_clinics_list[[i]]
+  
+  #Calculate travel time for the current centroid and its closest clinics
+  results_for_centroid <- calculate_travel_time(centroid, closest_clinics)
+  
+  # Store the results for the current centroid
+  all_results_list <- append(all_results_list, list(results_for_centroid))
+}
+
+#Save results list
+saveRDS(all_results_list, file = "all_results_list.rds")
+
+
+#Extract lat_lon values
+lat_lon_values <- centroids_ATL$lat_lon
+
+#Initialize an empty data frame to store the results
+result_df <- data.frame(lat_lon = lat_lon_values, stringsAsFactors = FALSE)
+
+
+#Iterate through each element in all_results_list to find the shortest travel time
+for (i in seq_along(all_results_list)) {
+  #Extract the current sublist
+  result_list <- all_results_list[[i]]
+  
+  #Find the minimum value in the sublist
+  min_value <- min(unlist(result_list),na.rm = TRUE)  
+  
+  #Update the corresponding row in result_df with the minimum value
+  result_df[i, "min_travel_time"] <- min_value
+}
+
+
+#Write CSV file to save output
+write.csv(result_df, file='results_10closest.csv', row.names=F)
+```
+
+
+Get Geography (shapefiles)
+```{r}
+#Get geographies for GA
+ga_geo <- get_acs(
+  geography = "cbg", 
+  variables = 'B02001_001',
+  state = "GA", 
+  year = 2020,
+  geometry = T
+) %>% dplyr::select(-moe)
+
+#Subset to ATL Region (or whichever region/city of interest)
+ATL_geo <- ga_geo[grepl("^13067|^13089|^13121|^13135", ga_geo$GEOID), ] 
+
+
+```
+
+
+Combine Shapefiles with Data and Centroids
+```{r}
+result_df <- read.csv('results_10closest.csv')
+
+#Get GEOID for result_df
+transit_time <- centroids_ATL %>%
+  left_join(result_df, by = c('lat_lon')) %>%
+  mutate(min_travel_time = replace(min_travel_time, is.infinite(min_travel_time), NA)) %>%
+  dplyr::select(GEOID, min_travel_time)
+
+#Note you may need to run the commented codes below (ONCE) to get GEOID format to be correct
+#transit_time <- transit_time %>% mutate(GEOID=paste0("13",GEOID))
+#centroids <- centroids %>% mutate(GEOID=paste0("13",GEOID))
+
+#Join geography with data
+ATL_geo <- ATL_geo %>%
+  left_join(race_eth, by = c('GEOID')) %>%
+  left_join(centroids, by = c('GEOID')) %>%
+  left_join(transit_time, by = c('GEOID'))
+
+#Export file to save for later
+st_write(ATL_geo, "ATL_region.shp", driver = "ESRI Shapefile", append=F)
+```
+
+
+Create Map from Results
+```{r}
+#Convert clinic lat and long to geometry
+clinics_sf <- st_as_sf(
+  clinics_split,
+  coords=c('longitude','latitude'),
+  crs='NAD83'
+)
+
+#Subset to clinics in ATL
+clinics_sf_ATL <- st_intersection(clinics_sf,ATL_geo)
+
+#Create a tm_points layer for clinics_sf
+clinics_layer <- tm_shape(clinics_sf_ATL) +
+  tm_dots(size = 0.08, col = "white", title = 'PrEP clinics',
+  legend.show = TRUE)+
+  tm_add_legend(type = "symbol", col = "white", title = "PrEP Clinics")
+
+
+#Map ATL landmarks - this is optional! I downloaded the highways from online so the maps were easier to read for those familiar with Atlanta
+highways <- st_read("State_Highways.shp")
+
+#Transform the data to NAD83
+nad83_crs <- st_crs("+proj=longlat +datum=NAD83 +no_defs")
+highways_sf <- st_transform(highways, nad83_crs)
+highways_ATL <- highways_sf %>% filter(COUNTY_FIP %in% c("067", "089", "121", "135"))
+highways_ATL_sub <- subset(highways_sf, grepl('^(I-85|Georgia Highway 20|I-285)', ROAD_NAME))
+
+highways_ATL_sub <- st_intersection(highways_ATL_sub, ATL_geo)
+
+
+#Make the highways a shape file to add to future maps
+landmark <- tm_shape(highways_ATL) + 
+  tm_lines(col='black', lwd=2)  +
+  tm_add_legend(type = "line", col = "black", title = "Highways") 
+
+
+#Define the hex codes for green to red divergent color pallette
+green_to_red <- c("#006000", "#609900", "#FFFF72", "#FFAA00", "#FF0000", "#720000")
+
+#Create map of time to clinic
+ATL_time <- tm_shape(ATL_geo) + 
+  tm_fill(c('min_travel_time'),
+          style = 'fixed',
+          breaks =c(0,15,30,60,90,120,Inf), #this is cutpoints of travel time we picked ourselves
+          labels = c('0-15', '16-30', '31-60', '61-90', '91-120', '>120'),
+          palette = green_to_red,
+          textNA = "No Public Transit Available", #Text option for NA results
+          title = 'Time to clinic (min)') +
+  tm_borders() + 
+  tm_layout(main.title = 'Transit time to nearest PrEP clinic',
+            inner.margins = c(0.1, 0.02,0.05,0.2)) + 
+    landmark + clinics_layer #adds highways and PrEP clinics
+
+#View map
+ATL_time
+
+#Save map to computer 
+tmap_save(ATL_time, filename = "ATL_TransitTime_Map.png", width = 10, height = 8, units = "in")
+
+```
